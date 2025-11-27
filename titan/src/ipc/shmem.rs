@@ -407,6 +407,12 @@ pub unsafe trait SharedMemorySafe: Send + Sync {}
 macro_rules! impl_shared_memory_safe {
     ($($t:ty),* $(,)?) => {
         $(
+            // SAFETY: Primitive and atomic types satisfy all SharedMemorySafe requirements:
+            // - Have stable, well-defined layout (primitives and atomics have fixed representation)
+            // - Contain no pointers or references (they are value types)
+            // - Are Send + Sync by definition
+            // - Safe if Drop never runs (no Drop impl for primitives/atomics)
+            // - Can be safely shared across process boundaries (same representation everywhere)
             unsafe impl SharedMemorySafe for $t {}
         )*
     };
@@ -427,7 +433,12 @@ impl_shared_memory_safe! {
     AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize,
 }
 
-// Arrays are SharedMemorySafe if their elements are
+// SAFETY: Arrays are SharedMemorySafe when their elements are because:
+// - Array layout in repr(C) is well-defined: contiguous elements of type T
+// - If T contains no pointers, [T; N] contains no pointers
+// - If T is Send + Sync, so is [T; N]
+// - Arrays have no Drop impl if T has no Drop impl
+// - Elements remain valid across process boundaries if T does
 unsafe impl<T: SharedMemorySafe, const N: usize> SharedMemorySafe for [T; N] {}
 
 /// Smart pointer to POSIX shared memory with typestate-based cleanup.
@@ -651,6 +662,13 @@ impl<T: SharedMemorySafe> Shm<T, Creator> {
             return Err(ShmError::posix("ftruncate", path, e));
         }
 
+        // SAFETY: mmap is called with:
+        // - null_mut() to let the kernel choose the address
+        // - size_of::<T>() which is the exact size we need
+        // - READ | WRITE permissions as we need to initialize and use the memory
+        // - SHARED flag for cross-process access
+        // - Valid file descriptor from shm_open
+        // - Offset 0 to map from the beginning
         let ptr_result = unsafe {
             mmap(
                 null_mut(),
@@ -670,6 +688,8 @@ impl<T: SharedMemorySafe> Shm<T, Creator> {
             }
         };
 
+        // SAFETY: mmap returns a non-null pointer on success (checked above via Ok branch),
+        // and the pointer is properly aligned for T as guaranteed by mmap for page-aligned memory
         let ptr = unsafe { NonNull::new_unchecked(ptr as *mut T) };
 
         let shm = Self {
@@ -748,18 +768,17 @@ impl<T: SharedMemorySafe> Shm<T, Opener> {
         }
 
         // Map into our address space
-        //
-        // SAFETY: We are mapping existing shared memory that doesn't alias
-        // any existing Rust objects in this process:
-        // - Allocated: Shared memory exists (shm_open succeeded)
-        // - Size valid: fstat confirmed st_size == size_of::<T>()
-        // - FD valid: shm_open succeeded, fd refers to valid shared memory object
-        // - Aligned: mmap returns page-aligned addresses (typically 4KB), satisfying any T's alignment
-        // - No aliasing: Mapping in this process doesn't alias other local objects
-        // - Permissions: READ|WRITE for interior mutability via atomics
-        // - Initialized: Creator must have initialized via T::default() before sharing
-        // - Concurrent access: T: SharedMemorySafe ensures safe cross-process access
         let ptr_result = unsafe {
+            // SAFETY: We are mapping existing shared memory that doesn't alias
+            // any existing Rust objects in this process:
+            // - Allocated: Shared memory exists (shm_open succeeded)
+            // - Size valid: fstat confirmed st_size == size_of::<T>()
+            // - FD valid: shm_open succeeded, fd refers to valid shared memory object
+            // - Aligned: mmap returns page-aligned addresses (typically 4KB), satisfying any T's alignment
+            // - No aliasing: Mapping in this process doesn't alias other local objects
+            // - Permissions: READ|WRITE for interior mutability via atomics
+            // - Initialized: Creator must have initialized before sharing
+            // - Concurrent access: T: SharedMemorySafe ensures safe cross-process access
             mmap(
                 null_mut(),
                 size_of::<T>(),
@@ -791,6 +810,11 @@ impl<T: SharedMemorySafe> Shm<T, Opener> {
 
 impl<T: SharedMemorySafe, Mode: ShmMode> Drop for Shm<T, Mode> {
     fn drop(&mut self) {
+        // SAFETY: munmap is called with:
+        // - A pointer that was returned by mmap (stored in self.ptr)
+        // - The exact size that was originally mapped (stored in self.size)
+        // The memory region is still valid as we're in drop, meaning no other
+        // code has unmapped it yet
         unsafe {
             let _ = munmap(self.ptr.as_ptr() as *mut _, self.size);
         }
