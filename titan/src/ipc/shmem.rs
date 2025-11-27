@@ -143,6 +143,8 @@ pub enum ShmError {
         expected: usize,
         actual: i64,
     },
+    /// Timed out waiting for shared memory to be initialized by creator.
+    InitTimeout { path: String },
 }
 
 impl ShmError {
@@ -173,6 +175,9 @@ impl fmt::Display for ShmError {
                 "shared memory `{}` size mismatch: expected {} bytes, got {}",
                 path, expected, actual
             ),
+            ShmError::InitTimeout { path } => {
+                write!(f, "timed out waiting for `{}` to be initialized", path)
+            }
         }
     }
 }
@@ -441,6 +446,13 @@ impl_shared_memory_safe! {
 // - Elements remain valid across process boundaries if T does
 unsafe impl<T: SharedMemorySafe, const N: usize> SharedMemorySafe for [T; N] {}
 
+// SAFETY: MaybeUninit<T> is SharedMemorySafe when T is because:
+// - MaybeUninit<T> has the same layout as T (repr(transparent) over union containing T)
+// - If T contains no pointers, MaybeUninit<T> contains no pointers
+// - If T is Send + Sync, so is MaybeUninit<T>
+// - MaybeUninit has no Drop impl
+unsafe impl<T: SharedMemorySafe> SharedMemorySafe for std::mem::MaybeUninit<T> {}
+
 /// Smart pointer to POSIX shared memory with typestate-based cleanup.
 ///
 /// `Shm<T, Mode>` wraps a pointer to shared memory, providing safe access via
@@ -595,9 +607,6 @@ impl<T: SharedMemorySafe> Shm<T, Creator> {
     /// This function mmaps shared memory and calls the provided initializer with
     /// a raw pointer to the uninitialized region. The initializer must fully
     /// initialize all bytes of `T` to avoid undefined behavior.
-    ///
-    /// This design avoids stack allocation of large types by letting callers write
-    /// directly into the mmap'd region field-by-field.
     ///
     /// # Arguments
     ///

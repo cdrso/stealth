@@ -58,6 +58,9 @@
 //! ```text
 //! Queue in Shared Memory (/dev/shm):
 //! ┌────────────────────────────────────────┐
+//! │ InitMarker (64-byte aligned)           │
+//! │  - magic: AtomicU64                    │
+//! ├────────────────────────────────────────┤
 //! │ ProducerState (64-byte aligned)        │
 //! │  - head: AtomicUsize                   │
 //! │  - cached_tail: usize                  │
@@ -76,10 +79,14 @@
 
 use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
-use std::sync::atomic::AtomicUsize;
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 use super::shmem::{Creator, Opener, Shm, ShmError, ShmMode};
 use crate::SharedMemorySafe;
+
+const INIT_MAGIC: u64 = 0x5350_5343_494E_4954; // "SPSCINIT" in ASCII
+const INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Marker type: Only producer accesses this cell.
 struct ProducerRole;
@@ -167,44 +174,35 @@ impl Default for ConsumerState {
     }
 }
 
+
+#[derive(SharedMemorySafe)]
+#[repr(C)]
+#[repr(align(64))]
+struct InitMarker(AtomicU64);
+
 #[derive(SharedMemorySafe)]
 #[repr(C)]
 struct Slot<T: SharedMemorySafe> {
-    value: SlotCell<T>,
-}
-
-impl<T: SharedMemorySafe + Default> Default for Slot<T> {
-    fn default() -> Self {
-        Self {
-            value: SlotCell::new(T::default()),
-        }
-    }
+    value: SlotCell<MaybeUninit<T>>,
 }
 
 #[derive(SharedMemorySafe)]
 #[repr(C)]
-struct SpscQueue<T: SharedMemorySafe + Default, const N: usize> {
+struct SpscQueue<T: SharedMemorySafe, const N: usize> {
+    /// Magic value to indicate initialization is complete.
+    init: InitMarker,
+
     /// Producer state (head index + cached tail).
     producer: ProducerState,
 
     /// Consumer state (tail index + cached head).
     consumer: ConsumerState,
 
-    /// Ring buffer slots.
+    /// Ring buffer slots (uninitialized until written by producer).
     buffer: [Slot<T>; N],
 }
 
-impl<T: SharedMemorySafe + Default, const N: usize> Default for SpscQueue<T, N> {
-    fn default() -> Self {
-        Self {
-            producer: ProducerState::default(),
-            consumer: ConsumerState::default(),
-            buffer: std::array::from_fn(|_| Slot::default()),
-        }
-    }
-}
-
-impl<T: SharedMemorySafe + Default, const N: usize> SpscQueue<T, N> {
+impl<T: SharedMemorySafe, const N: usize> SpscQueue<T, N> {
     #[inline(always)]
     const fn slot_index(idx: usize) -> usize {
         idx % N
@@ -212,37 +210,71 @@ impl<T: SharedMemorySafe + Default, const N: usize> SpscQueue<T, N> {
 
     /// Initializes the queue directly inside shared memory.
     ///
+    /// Writes default values for producer and consumer state, then sets the magic
+    /// marker with `Release` ordering to signal initialization is complete. The buffer
+    /// slots are left uninitialized (`MaybeUninit`) until written by the producer.
+    ///
     /// # Safety
     ///
     /// Caller must ensure:
-    /// - `ptr` points to a valid, properly aligned, writable memory region of size `size_of::<SpscQueue<T, N>>()`
-    /// - The memory region is not accessed by any other thread during initialization
-    /// - The memory region is uninitialized (or can be safely overwritten)
+    ///
+    /// - **Pointer validity**: `ptr` is non-null, well-aligned for `SpscQueue<T, N>`,
+    ///   and points to a dereferenceable region of at least `size_of::<Self>()` bytes
+    /// - **Writability**: The memory region is writable
+    /// - **Aliasing**: No other references to this memory exist during initialization
+    ///   (exclusive access required)
     unsafe fn init_shared(ptr: *mut Self) {
+        // SAFETY: Caller guarantees ptr is valid, aligned, writable, and exclusively owned.
+        // We use addr_of_mut! to write fields without creating intermediate references,
+        // which would be UB for uninitialized memory.
         unsafe {
-            // SAFETY: The caller guarantees ptr points to valid,
-            // uninitialized memory of the correct size.
             std::ptr::addr_of_mut!((*ptr).producer).write(ProducerState::default());
             std::ptr::addr_of_mut!((*ptr).consumer).write(ConsumerState::default());
+            (*ptr).init.0.store(INIT_MAGIC, std::sync::atomic::Ordering::Release);
+        }
+    }
 
-            // SAFETY: buffer_ptr points to the array field within the valid memory region.
-            let buffer_ptr = std::ptr::addr_of_mut!((*ptr).buffer);
-            for i in 0..N {
-                let slot_ptr = (*buffer_ptr).as_mut_ptr().add(i);
-                // SAFETY: slot_ptr is within bounds of the array (i < N) and properly aligned
-                std::ptr::write(slot_ptr, Slot::default());
+    /// Spins until the queue is initialized or timeout expires.
+    ///
+    /// Polls the magic marker with `Acquire` ordering until it matches [`INIT_MAGIC`],
+    /// establishing a synchronizes-with relationship with the `Release` store in
+    /// [`init_shared()`](Self::init_shared). This guarantees all initialization writes
+    /// are visible before this function returns `true`.
+    ///
+    /// Returns `true` if initialized, `false` if timed out.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure:
+    ///
+    /// - **Pointer validity**: `ptr` is non-null, well-aligned for `SpscQueue<T, N>`,
+    ///   and points to mapped shared memory of at least `size_of::<Self>()` bytes
+    /// - **Lifetime**: The memory remains mapped for the duration of this call
+    unsafe fn wait_for_init(ptr: *const Self, timeout: std::time::Duration) -> bool {
+        use std::sync::atomic::Ordering;
+        let start = std::time::Instant::now();
+        loop {
+            // SAFETY: Caller guarantees ptr is valid and points to mapped shared memory.
+            // Reading an AtomicU64 is always safe regardless of initialization state
+            // (no invalid bit patterns for integers).
+            if unsafe { (*ptr).init.0.load(Ordering::Acquire) } == INIT_MAGIC {
+                return true;
             }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::hint::spin_loop();
         }
     }
 }
 
 // SAFETY: SpscQueue is Send because all fields are Send (AtomicUsize, SpscCell).
-unsafe impl<T: SharedMemorySafe + Default, const N: usize> Send for SpscQueue<T, N> {}
+unsafe impl<T: SharedMemorySafe, const N: usize> Send for SpscQueue<T, N> {}
 
 // SAFETY: SpscQueue is Sync because concurrent access is mediated by atomics:
 // - head/tail are AtomicUsize with Release/Acquire ordering
 // - Buffer slots are protected by the SPSC invariant (see SpscCell)
-unsafe impl<T: SharedMemorySafe + Default, const N: usize> Sync for SpscQueue<T, N> {}
+unsafe impl<T: SharedMemorySafe, const N: usize> Sync for SpscQueue<T, N> {}
 
 /// Marker type to opt-out of `Sync` while remaining `Send`.
 type PhantomUnsync = PhantomData<Cell<&'static ()>>;
@@ -255,7 +287,7 @@ type PhantomUnsync = PhantomData<Cell<&'static ()>>;
 ///
 /// # Type Parameters
 ///
-/// - `T`: Element type (must be [`SharedMemorySafe`] + [`Default`])
+/// - `T`: Element type (must be [`SharedMemorySafe`])
 /// - `N`: Queue capacity
 /// - `Mode`: Either [`Creator`] or [`Opener`]
 ///
@@ -284,12 +316,12 @@ type PhantomUnsync = PhantomData<Cell<&'static ()>>;
 /// **Cross-process note**: The type system cannot prevent another process from
 /// calling [`open()`](Producer::open) on the same path. Users must ensure only
 /// one producer exists across all processes.
-pub struct Producer<T: SharedMemorySafe + Default, const N: usize, Mode: ShmMode> {
+pub struct Producer<T: SharedMemorySafe, const N: usize, Mode: ShmMode> {
     shm: Shm<SpscQueue<T, N>, Mode>,
     _unsync: PhantomUnsync,
 }
 
-impl<T: SharedMemorySafe + Default, const N: usize> Producer<T, N, Creator> {
+impl<T: SharedMemorySafe, const N: usize> Producer<T, N, Creator> {
     /// Creates a new queue and returns the producer end.
     ///
     /// This creates new POSIX shared memory at `path`, initializes the queue structure,
@@ -324,11 +356,13 @@ impl<T: SharedMemorySafe + Default, const N: usize> Producer<T, N, Creator> {
     }
 }
 
-impl<T: SharedMemorySafe + Default, const N: usize> Producer<T, N, Opener> {
+impl<T: SharedMemorySafe, const N: usize> Producer<T, N, Opener> {
     /// Opens an existing queue and returns the producer end.
     ///
     /// This opens POSIX shared memory at `path` that was created by another process
     /// and returns a producer that will NOT unlink on drop (Opener mode).
+    ///
+    /// Waits up to 1 second for the creator to finish initializing the queue.
     ///
     /// # Arguments
     ///
@@ -340,6 +374,7 @@ impl<T: SharedMemorySafe + Default, const N: usize> Producer<T, N, Opener> {
     /// - Shared memory object doesn't exist at `path`
     /// - Insufficient permissions to access the object
     /// - Size mismatch (different capacity used by creator)
+    /// - Initialization timeout (creator didn't finish within 1 second)
     ///
     /// # Examples
     ///
@@ -351,6 +386,14 @@ impl<T: SharedMemorySafe + Default, const N: usize> Producer<T, N, Opener> {
     /// ```
     pub fn open(path: &str) -> Result<Self, ShmError> {
         let shm = Shm::<SpscQueue<T, N>, Opener>::open(path)?;
+        // SAFETY: Shm::open guarantees the returned pointer is:
+        // - Non-null and well-aligned (mmap guarantees page alignment)
+        // - Points to mapped memory of exactly size_of::<SpscQueue<T, N>>() bytes
+        // - Valid for reads (mapped with PROT_READ | PROT_WRITE)
+        // The memory remains mapped for the lifetime of `shm`.
+        if !unsafe { SpscQueue::<T, N>::wait_for_init(&*shm, INIT_TIMEOUT) } {
+            return Err(ShmError::InitTimeout { path: path.to_string() });
+        }
         Ok(Self {
             shm,
             _unsync: PhantomData,
@@ -358,7 +401,7 @@ impl<T: SharedMemorySafe + Default, const N: usize> Producer<T, N, Opener> {
     }
 }
 
-impl<T: SharedMemorySafe + Default, const N: usize, Mode: ShmMode> Producer<T, N, Mode> {
+impl<T: SharedMemorySafe, const N: usize, Mode: ShmMode> Producer<T, N, Mode> {
     /// Attempts to push an item onto the queue.
     ///
     /// This is a wait-free operation that completes in bounded time. If the queue is
@@ -423,7 +466,7 @@ impl<T: SharedMemorySafe + Default, const N: usize, Mode: ShmMode> Producer<T, N
         // - slot_index is always < N due to modulo operation
         unsafe {
             let slot_ptr = queue.buffer[slot_index].value.get().get();
-            std::ptr::write(slot_ptr, item);
+            std::ptr::write(slot_ptr, MaybeUninit::new(item));
         }
 
         // Publish the new head (release to sync with consumer)
@@ -444,9 +487,9 @@ impl<T: SharedMemorySafe + Default, const N: usize, Mode: ShmMode> Producer<T, N
 ///
 /// # Type Parameters
 ///
-/// - `T`: Element type (must be [`SharedMemorySafe`] + [`Default`])
-/// - `N`: Queue capacity (power-of-2 recommended for best performance)
-/// - `Mode`: Either [`Creator`] or [`Opener`] (typestate for cleanup behavior)
+/// - `T`: Element type (must be [`SharedMemorySafe`])
+/// - `N`: Queue capacity
+/// - `Mode`: Either [`Creator`] or [`Opener`]
 ///
 /// # Examples
 ///
@@ -472,12 +515,12 @@ impl<T: SharedMemorySafe + Default, const N: usize, Mode: ShmMode> Producer<T, N
 /// **Cross-process note**: The type system cannot prevent another process from
 /// calling [`open()`](Consumer::open) on the same path. Users must ensure only
 /// one consumer exists across all processes.
-pub struct Consumer<T: SharedMemorySafe + Default, const N: usize, Mode: ShmMode> {
+pub struct Consumer<T: SharedMemorySafe, const N: usize, Mode: ShmMode> {
     shm: Shm<SpscQueue<T, N>, Mode>,
     _unsync: PhantomUnsync,
 }
 
-impl<T: SharedMemorySafe + Default, const N: usize> Consumer<T, N, Creator> {
+impl<T: SharedMemorySafe, const N: usize> Consumer<T, N, Creator> {
     /// Creates a new queue and returns the consumer end.
     ///
     /// This creates new POSIX shared memory at `path`, initializes the queue structure,
@@ -515,11 +558,13 @@ impl<T: SharedMemorySafe + Default, const N: usize> Consumer<T, N, Creator> {
     }
 }
 
-impl<T: SharedMemorySafe + Default, const N: usize> Consumer<T, N, Opener> {
+impl<T: SharedMemorySafe, const N: usize> Consumer<T, N, Opener> {
     /// Opens an existing queue and returns the consumer end.
     ///
     /// This opens POSIX shared memory at `path` that was created by another process
     /// and returns a consumer that will NOT unlink on drop (Opener mode).
+    ///
+    /// Waits up to 1 second for the creator to finish initializing the queue.
     ///
     /// # Arguments
     ///
@@ -531,6 +576,8 @@ impl<T: SharedMemorySafe + Default, const N: usize> Consumer<T, N, Opener> {
     /// - Shared memory object doesn't exist at `path`
     /// - Insufficient permissions to access the object
     /// - Size mismatch (different capacity used by creator)
+    /// - Initialization timeout (creator didn't finish within 1 second)
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -541,6 +588,14 @@ impl<T: SharedMemorySafe + Default, const N: usize> Consumer<T, N, Opener> {
     /// ```
     pub fn open(path: &str) -> Result<Self, ShmError> {
         let shm = Shm::<SpscQueue<T, N>, Opener>::open(path)?;
+        // SAFETY: Shm::open guarantees the returned pointer is:
+        // - Non-null and well-aligned (mmap guarantees page alignment)
+        // - Points to mapped memory of exactly size_of::<SpscQueue<T, N>>() bytes
+        // - Valid for reads (mapped with PROT_READ | PROT_WRITE)
+        // The memory remains mapped for the lifetime of `shm`.
+        if !unsafe { SpscQueue::<T, N>::wait_for_init(&*shm, INIT_TIMEOUT) } {
+            return Err(ShmError::InitTimeout { path: path.to_string() });
+        }
         Ok(Self {
             shm,
             _unsync: PhantomData,
@@ -548,7 +603,7 @@ impl<T: SharedMemorySafe + Default, const N: usize> Consumer<T, N, Opener> {
     }
 }
 
-impl<T: SharedMemorySafe + Default, const N: usize, Mode: ShmMode> Consumer<T, N, Mode> {
+impl<T: SharedMemorySafe, const N: usize, Mode: ShmMode> Consumer<T, N, Mode> {
     /// Attempts to pop an item from the queue.
     ///
     /// This is a wait-free operation that completes in bounded time. If the queue is
@@ -617,9 +672,10 @@ impl<T: SharedMemorySafe + Default, const N: usize, Mode: ShmMode> Consumer<T, N
         // - tail hasn't been published yet (store happens after this)
         // - slot_index is always < N due to modulo operation
         // - The producer won't write to this slot until we publish the new tail
+        // - The slot was initialized by the producer (MaybeUninit is safe to assume_init)
         let item = unsafe {
             let slot_ptr = queue.buffer[slot_index].value.get().get();
-            std::ptr::read(slot_ptr)
+            std::ptr::read(slot_ptr).assume_init()
         };
 
         // Publish the new tail (release to sync with producer)
@@ -667,19 +723,16 @@ mod tests {
     fn test_buffer_starts_on_separate_cache_line() {
         use std::mem::{offset_of, size_of};
 
-        // Verify ProducerState and ConsumerState each take exactly one cache line
+        // Verify InitMarker, ProducerState and ConsumerState each take exactly one cache line
+        assert_eq!(size_of::<InitMarker>(), CACHE_LINE_SIZE);
         assert_eq!(size_of::<ProducerState>(), CACHE_LINE_SIZE);
         assert_eq!(size_of::<ConsumerState>(), CACHE_LINE_SIZE);
 
-        // Verify buffer starts at offset 128 (3rd cache line)
+        // Verify buffer starts at offset 192 (4th cache line)
         // This ensures no false sharing between consumer and buffer
         type TestQueue = SpscQueue<u64, 16>;
-        assert_eq!(offset_of!(TestQueue, buffer), 2 * CACHE_LINE_SIZE);
+        assert_eq!(offset_of!(TestQueue, buffer), 3 * CACHE_LINE_SIZE);
     }
-
-    // ========================================================================
-    // Queue Operation Tests
-    // ========================================================================
 
     #[test]
     fn test_basic_push_pop() {
