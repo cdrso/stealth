@@ -24,3 +24,11 @@ proc-macro-crate = "3.4.0"
 
 # Dev dependencies
 trybuild = "1.0.114"
+
+# Performance settings
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+debug = 1
+strip = false
