@@ -54,17 +54,17 @@ fn bench_throughput(producer_cpu: Option<usize>, consumer_cpu: Option<usize>) {
 
     let ready = Arc::new(AtomicBool::new(false));
     let ready_clone = ready.clone();
-    let path_clone = path.clone();
 
     // Consumer thread
     let consumer_thread = std::thread::spawn(move || {
-        let consumer = Consumer::<Payload, QUEUE_SIZE, _>::open(&path_clone).unwrap();
+        let consumer = Consumer::<Payload, QUEUE_SIZE, _>::open(&path).unwrap();
         pin_to_cpu(consumer_cpu);
 
         // Signal ready
         ready_clone.store(true, Ordering::Release);
 
-        for expected in 0..ITERATIONS as Payload {
+        let iterations = Payload::try_from(ITERATIONS).expect("ITERATIONS exceeds Payload range");
+        for expected in 0..iterations {
             let value = consumer.pop_blocking();
             assert_eq!(value, expected, "Data corruption");
         }
@@ -79,7 +79,8 @@ fn bench_throughput(producer_cpu: Option<usize>, consumer_cpu: Option<usize>) {
 
     let start = Instant::now();
 
-    for i in 0..ITERATIONS as Payload {
+    let iterations = Payload::try_from(ITERATIONS).expect("ITERATIONS exceeds Payload range");
+    for i in 0..iterations {
         producer.push_blocking(i);
     }
 
@@ -98,12 +99,11 @@ fn bench_rtt(producer_cpu: Option<usize>, consumer_cpu: Option<usize>) {
 
     let ready = Arc::new(AtomicBool::new(false));
     let ready_clone = ready.clone();
-    let q1_path_clone = q1_path.clone();
     let q2_path_clone = q2_path.clone();
 
     // Responder thread
     let responder = std::thread::spawn(move || {
-        let q1_consumer = Consumer::<Payload, QUEUE_SIZE, _>::open(&q1_path_clone).unwrap();
+        let q1_consumer = Consumer::<Payload, QUEUE_SIZE, _>::open(&q1_path).unwrap();
         let q2_producer = Producer::<Payload, QUEUE_SIZE, _>::create(&q2_path_clone).unwrap();
         pin_to_cpu(consumer_cpu);
 
@@ -128,7 +128,8 @@ fn bench_rtt(producer_cpu: Option<usize>, consumer_cpu: Option<usize>) {
 
     let start = Instant::now();
 
-    for i in 0..ITERATIONS as Payload {
+    let iterations = Payload::try_from(ITERATIONS).expect("ITERATIONS exceeds Payload range");
+    for i in 0..iterations {
         q1_producer.push_blocking(i);
         let _ = q2_consumer.pop_blocking();
     }
