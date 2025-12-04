@@ -1,8 +1,8 @@
 // Allow the crate to reference itself as ::titan for derive macro usage
 extern crate self as titan;
 
+pub mod control;
 pub mod ipc;
-pub mod protocol;
 
 #[doc(inline)]
 pub use titan_derive::SharedMemorySafe;
